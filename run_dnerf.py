@@ -3,11 +3,13 @@ import imageio
 import time
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm, trange
+from torch import nn
 
 
 from run_dnerf_helpers import *
 
 from load_blender import load_blender_data
+from load_llff import *
 
 try:
     from apex import amp
@@ -219,6 +221,7 @@ def create_nerf(args):
                  input_ch_views=input_ch_views, input_ch_time=input_ch_time,
                  use_viewdirs=args.use_viewdirs, embed_fn=embed_fn,
                  zero_canonical=not args.not_zero_canonical).to(device)
+    model = nn.DataParallel(model)
     grad_vars = list(model.parameters())
 
     model_fine = None
@@ -228,6 +231,7 @@ def create_nerf(args):
                           input_ch_views=input_ch_views, input_ch_time=input_ch_time,
                           use_viewdirs=args.use_viewdirs, embed_fn=embed_fn,
                           zero_canonical=not args.not_zero_canonical).to(device)
+        model_fine = nn.DataParallel(model_fine)            
         grad_vars += list(model_fine.parameters())
 
     network_query_fn = lambda inputs, viewdirs, ts, network_fn : run_network(inputs, viewdirs, ts, network_fn,
@@ -589,8 +593,10 @@ def config_parser():
                         help='sampling linearly in disparity rather than depth')
     parser.add_argument("--spherify", action='store_true', 
                         help='set for spherical 360 scenes')
-    parser.add_argument("--llffhold", type=int, default=8, 
+    parser.add_argument("--llffhold", type=int, default=20, 
                         help='will take every 1/N images as LLFF test set, paper uses 8')
+    parser.add_argument("--colmap_depth", action='store_true',
+                        help="Use depth supervision by colmap.")
 
     # logging/saving options
     parser.add_argument("--i_print",   type=int, default=1000,
@@ -628,7 +634,46 @@ def train():
             images = images[...,:3]
 
         # images = [rgb2hsv(img) for img in images]
+    elif args.dataset_type == 'llff':
+        if args.colmap_depth:
+            depth_gts = load_colmap_depth(args.datadir, factor=args.factor, bd_factor=.75)
+        images, poses, times, bds, render_poses, i_test = load_llff_data(args.datadir, args.factor,
+                                                                  recenter=True, bd_factor=.75,
+                                                                  spherify=args.spherify)
+        render_times = torch.linspace(0., 1., render_poses.shape[0])
+        hwf = poses[0,:3,-1]
+        poses = poses[:,:3,:4]
+        print('Loaded llff', images.shape, render_poses.shape, hwf, args.datadir)
+        if not isinstance(i_test, list):
+            i_test = [i_test]
 
+        # if args.llffhold > 0:
+        #     print('Auto LLFF holdout,', args.llffhold)
+        #     i_test = np.arange(images.shape[0])[::args.llffhold]
+        i_test = np.array([1])
+        # if args.test_scene is not None:
+        #     i_test = np.array([i for i in args.test_scene])
+
+        if i_test[0] < 0:
+            i_test = []
+
+        i_val = i_test
+        # if args.train_scene is None:
+        i_train = np.array([i for i in np.arange(int(images.shape[0])) if
+                    (i not in i_test and i not in i_val)])
+        # else:
+        #     i_train = np.array([i for i in args.train_scene if
+        #                 (i not in i_test and i not in i_val)])
+
+        print('DEFINING BOUNDS')
+        if args.no_ndc:
+            near = np.ndarray.min(bds) * .9
+            far = np.ndarray.max(bds) * 1.
+            
+        else:
+            near = 0.
+            far = 1.
+        print('NEAR FAR', near, far)
     else:
         print('Unknown dataset type', args.dataset_type, 'exiting')
         return
@@ -691,7 +736,7 @@ def train():
             print('test poses shape', render_poses.shape)
 
             rgbs, _ = render_path(render_poses, render_times, hwf, args.chunk, render_kwargs_test, gt_imgs=images,
-                                  savedir=testsavedir, render_factor=args.render_factor, save_also_gt=True)
+                                  savedir=testsavedir, render_factor=args.render_factor, save_also_gt=False)
             print('Done rendering', testsavedir)
             imageio.mimwrite(os.path.join(testsavedir, 'video.mp4'), to8b(rgbs), fps=30, quality=8)
 
@@ -878,6 +923,7 @@ def train():
             tqdm_txt = f"[TRAIN] Iter: {i} Loss_fine: {img_loss.item()} PSNR: {psnr.item()}"
             if args.add_tv_loss:
                 tqdm_txt += f" TV: {tv_loss.item()}"
+            print('loss: {}, psnr: {}'.format(img_loss.item(), psnr.item()))
             tqdm.write(tqdm_txt)
 
             writer.add_scalar('loss', img_loss.item(), i)
@@ -898,7 +944,7 @@ def train():
         if i%args.i_img==0:
             torch.cuda.empty_cache()
             # Log a rendered validation view to Tensorboard
-            img_i=np.random.choice(i_val)
+            img_i=i_val[0]
             target = images[img_i]
             pose = poses[img_i, :3,:4]
             frame_time = times[img_i]
@@ -907,6 +953,7 @@ def train():
                                                     **render_kwargs_test)
 
             psnr = mse2psnr(img2mse(rgb, target))
+            print('validation PSNR: {}'.format(psnr.item()))
             writer.add_image('gt', to8b(target.cpu().numpy()), i, dataformats='HWC')
             writer.add_image('rgb', to8b(rgb.cpu().numpy()), i, dataformats='HWC')
             writer.add_image('disp', disp.cpu().numpy(), i, dataformats='HW')

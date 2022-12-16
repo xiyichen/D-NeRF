@@ -90,13 +90,17 @@ def load_blender_data(basedir, half_res=False, testskip=1):
         skip = testskip
             
         for t, frame in enumerate(meta['frames'][::skip]):
-            fname = os.path.join(basedir, frame['file_path'] + '.png')
-            imgs.append(imageio.imread(fname))
+            if '.jpg' in frame['file_path']:
+              fname = os.path.join(basedir, frame['file_path'])
+            else:
+              fname = os.path.join(basedir, frame['file_path'] + '.png')
+            imgs.append(imageio.imread(fname, pilmode='RGBA'))
             poses.append(np.array(frame['transform_matrix']))
             cur_time = frame['time'] if 'time' in frame else float(t) / (len(meta['frames'][::skip])-1)
             times.append(cur_time)
 
-        assert times[0] == 0, "Time must start at 0"
+        if s == 'train':
+            assert times[0] == 0, "Time must start at 0"
 
         imgs = (np.array(imgs) / 255.).astype(np.float32)  # keep all 4 channels (RGBA)
         poses = np.array(poses).astype(np.float32)
@@ -113,6 +117,7 @@ def load_blender_data(basedir, half_res=False, testskip=1):
     times = np.concatenate(all_times, 0)
     
     H, W = imgs[0].shape[:2]
+    # print(H, W)
     camera_angle_x = float(meta['camera_angle_x'])
     focal = .5 * W / np.tan(.5 * camera_angle_x)
 
@@ -131,14 +136,17 @@ def load_blender_data(basedir, half_res=False, testskip=1):
         H = H//2
         W = W//2
         focal = focal/2.
-
+        # print(H, W)
+        # print(imgs.shape)
+        # exit()
         imgs_half_res = np.zeros((imgs.shape[0], H, W, 4))
         for i, img in enumerate(imgs):
-            imgs_half_res[i] = cv2.resize(img, (H, W), interpolation=cv2.INTER_AREA)
+            imgs_half_res[i] = cv2.resize(img, (W, H), interpolation=cv2.INTER_AREA)
         imgs = imgs_half_res
         # imgs = tf.image.resize_area(imgs, [400, 400]).numpy()
 
-        
+    print(imgs.shape, poses.shape, times, render_poses.shape, render_times.shape, H, W, focal, i_split)
     return imgs, poses, times, render_poses, render_times, [H, W, focal], i_split
+
 
 
